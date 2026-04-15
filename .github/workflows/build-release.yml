@@ -1,0 +1,220 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [ollvm-21.x]
+    tags: ['v*']
+  pull_request:
+    branches: [ollvm-21.x]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows
+            runner: windows-2022
+            build_type: Debug
+          - os: windows
+            runner: windows-2022
+            build_type: Release
+          - os: linux
+            runner: ubuntu-24.04
+            build_type: Debug
+          - os: linux
+            runner: ubuntu-24.04
+            build_type: Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ---------- Linux prep ----------
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          df -h
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache python3 zstd
+
+      # ---------- Windows prep ----------
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja + sccache (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install ninja -y
+          choco install sccache -y
+
+      # ---------- Cache ----------
+      - name: ccache (Linux)
+        if: runner.os == 'Linux'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.build_type }}
+          max-size: 2G
+          variant: ccache
+
+      - name: sccache cache (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/sccache
+          key: sccache-${{ matrix.os }}-${{ matrix.build_type }}-${{ github.sha }}
+          restore-keys: sccache-${{ matrix.os }}-${{ matrix.build_type }}-
+
+      - name: Start sccache (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "SCCACHE_DIR=$env:GITHUB_WORKSPACE\sccache" >> $env:GITHUB_ENV
+          echo "SCCACHE_CACHE_SIZE=2G" >> $env:GITHUB_ENV
+          sccache --start-server
+
+      # ---------- Configure (Windows, Ninja + MSVC) ----------
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          mkdir build
+          cd build
+          cmake -G Ninja ^
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} ^
+            -DCMAKE_POLICY_DEFAULT_CMP0141=NEW ^
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded ^
+            -DLLVM_ENABLE_PROJECTS="llvm;clang" ^
+            -DLLVM_ENABLE_RTTI=ON ^
+            -DLLVM_ENABLE_EH=ON ^
+            -DLLVM_TARGETS_TO_BUILD="X86" ^
+            -DLLVM_INCLUDE_TESTS=ON ^
+            -DLLVM_BUILD_TESTS=OFF ^
+            -DLLVM_INCLUDE_BENCHMARKS=OFF ^
+            -DLLVM_BUILD_BENCHMARKS=OFF ^
+            -DLLVM_INCLUDE_EXAMPLES=OFF ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
+            -DLLVM_ENABLE_ASSERTIONS=ON ^
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DLLVM_PARALLEL_LINK_JOBS=1 ^
+            -DCMAKE_INSTALL_PREFIX=%GITHUB_WORKSPACE%\install ^
+            ..\llvm
+
+      # ---------- Configure (Linux) ----------
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ "${{ matrix.build_type }}" = "Debug" ]; then
+            EXTRA="-DLLVM_USE_SPLIT_DWARF=ON -DLLVM_PARALLEL_LINK_JOBS=1"
+          fi
+          mkdir build && cd build
+          cmake -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DLLVM_ENABLE_PROJECTS="llvm;clang" \
+            -DLLVM_ENABLE_RTTI=ON \
+            -DLLVM_ENABLE_EH=ON \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_INCLUDE_TESTS=ON \
+            -DLLVM_BUILD_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_BUILD_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_ENABLE_ASSERTIONS=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/install \
+            $EXTRA \
+            ../llvm
+
+      # ---------- Build ----------
+      - name: Build
+        shell: bash
+        run: cmake --build build --parallel --target install
+
+      - name: sccache stats (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: sccache --show-stats
+
+      # ---------- Smoke test ----------
+      - name: Smoke test
+        shell: bash
+        run: |
+          echo 'int main(void){return 0;}' > t.c
+          ./install/bin/clang t.c -o t_plain || ./install/bin/clang.exe t.c -o t_plain.exe
+          # TODO: replace with your actual obfuscator flag once stable
+          # ./install/bin/clang -mllvm -enable-obf-flattening t.c -o t_obf
+
+      # ---------- Package ----------
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd install
+          tar --zstd -cf ../ollvm21-linux-${{ matrix.build_type }}.tar.zst .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # 7z gives ~3-4x better compression than zip on PDB-heavy Debug trees.
+          7z a -t7z -m0=lzma2 -mx=7 -mmt=on `
+            ollvm21-windows-${{ matrix.build_type }}.7z .\install\*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollvm21-${{ matrix.os }}-${{ matrix.build_type }}
+          path: |
+            ollvm21-*.tar.zst
+            ollvm21-*.7z
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') }}
