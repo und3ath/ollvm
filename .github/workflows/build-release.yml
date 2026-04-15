@@ -34,6 +34,9 @@ jobs:
             runner: ubuntu-24.04
             build_type: Release
 
+    env:
+      SCCACHE_IDLE_TIMEOUT: 0
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,11 +65,13 @@ jobs:
         with:
           arch: x64
 
-      - name: Install Ninja + sccache (Windows)
+      - name: Setup sccache (Windows)
         if: runner.os == 'Windows'
-        run: |
-          choco install ninja -y
-          choco install sccache -y
+        uses: mozilla-actions/sccache-action@v0.0.3
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
 
       # ---------- Cache ----------
       - name: ccache (Linux)
@@ -89,11 +94,16 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          echo "SCCACHE_DIR=$env:GITHUB_WORKSPACE\sccache" >> $env:GITHUB_ENV
-          echo "SCCACHE_CACHE_SIZE=2G" >> $env:GITHUB_ENV
-          sccache --start-server
+          $env:SCCACHE_DIR = "$env:GITHUB_WORKSPACE\sccache"
+          $env:SCCACHE_CACHE_SIZE = "2G"
 
-      # ---------- Configure (Windows, Ninja + MSVC) ----------
+          echo "SCCACHE_DIR=$env:SCCACHE_DIR" >> $env:GITHUB_ENV
+          echo "SCCACHE_CACHE_SIZE=$env:SCCACHE_CACHE_SIZE" >> $env:GITHUB_ENV
+
+          sccache --start-server
+          sccache --version
+
+      # ---------- Configure (Windows) ----------
       - name: Configure (Windows)
         if: runner.os == 'Windows'
         shell: cmd
@@ -167,8 +177,6 @@ jobs:
         run: |
           echo 'int main(void){return 0;}' > t.c
           ./install/bin/clang t.c -o t_plain || ./install/bin/clang.exe t.c -o t_plain.exe
-          # TODO: replace with your actual obfuscator flag once stable
-          # ./install/bin/clang -mllvm -enable-obf-flattening t.c -o t_obf
 
       # ---------- Package ----------
       - name: Package (Linux)
@@ -181,7 +189,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # 7z gives ~3-4x better compression than zip on PDB-heavy Debug trees.
           7z a -t7z -m0=lzma2 -mx=7 -mmt=on `
             ollvm21-windows-${{ matrix.build_type }}.7z .\install\*
 
